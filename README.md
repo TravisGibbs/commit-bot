@@ -1,6 +1,6 @@
 # commit-bot
 
-Harmless fun
+Harmless fun - using on my mac not supporting anything else 🙂‍↕️
 
 Do something like:
 
