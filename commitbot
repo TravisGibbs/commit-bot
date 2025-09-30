@@ -1,0 +1,118 @@
+#!/bin/bash
+set -euo pipefail
+
+# Configuration
+VANITY_PREFIX="${1:-c0de}" 
+VANITY_MAX_ATTEMPTS=10000000
+VANITY_TIMESTAMP=$(date +%s)
+VANITY_TREE=$(git write-tree)
+VANITY_PARENTS=$(git log -1 --format='%P' | sed 's/\([^ ]*\)/parent \1/g')
+VANITY_AUTHOR_IDENT="$(git log -1 --format='%an <%ae>')"
+VANITY_COMMITTER_IDENT="$(git config user.name) <$(git config user.email)>"
+VANITY_MESSAGE="$(git log -1 --format='%B' | sed 's/<!-- [0-9]* -->//' | sed 's/[[:space:]]*$//')"
+
+export VANITY_PREFIX
+export VANITY_TIMESTAMP
+export VANITY_MAX_ATTEMPTS
+export VANITY_TREE=$(echo -n "$VANITY_TREE" | base64)
+export VANITY_PARENTS=$(echo -n "$VANITY_PARENTS" | base64)
+export VANITY_AUTHOR_IDENT=$(echo -n "$VANITY_AUTHOR_IDENT" | base64)
+export VANITY_COMMITTER_IDENT=$(echo -n "$VANITY_COMMITTER_IDENT" | base64)
+export VANITY_MESSAGE=$(echo -n "$VANITY_MESSAGE" | base64)
+
+found_line=$(/usr/bin/env python3 - <<'PY'
+import base64, hashlib, os, sys
+import multiprocessing as mp
+
+def b64get(key):
+    v = os.environ.get(key, "")
+    return base64.b64decode(v.encode()).decode(errors="surrogatepass")
+
+def build_bytes_factory(tree, parents_block, author_ident, committer_ident, message, ts):
+    if parents_block and not parents_block.endswith("\n"):
+        parents_block += "\n"
+    base_message = message.rstrip("\n")
+    def build_bytes(nonce:int)->bytes:
+        msg_with_nonce = f"{base_message}\n\n<!-- {nonce} -->\n"
+        hdr = (
+            f"tree {tree}\n"
+            f"{parents_block}"
+            f"author {author_ident} {ts} +0000\n"
+            f"committer {committer_ident} {ts} +0000\n\n"
+        )
+        content = (hdr + msg_with_nonce).encode("utf-8", "surrogatepass")
+        return f"commit {len(content)}\0".encode("ascii") + content
+    return build_bytes
+
+def search_range(args):
+    lo, hi, prefix, tree, parents_block, author_ident, committer_ident, message, ts = args
+    build_bytes = build_bytes_factory(tree, parents_block, author_ident, committer_ident, message, ts)
+    p = prefix
+    for nonce in range(lo, hi):
+        if hashlib.sha1(build_bytes(nonce)).hexdigest().startswith(p):
+            return nonce
+    return None
+
+def main():
+    prefix = os.environ["VANITY_PREFIX"].lower()
+    tree = b64get("VANITY_TREE")
+    parents_block = b64get("VANITY_PARENTS")
+    author_ident = b64get("VANITY_AUTHOR_IDENT")
+    committer_ident = b64get("VANITY_COMMITTER_IDENT")
+    message = b64get("VANITY_MESSAGE")
+    ts = int(os.environ["VANITY_TIMESTAMP"])
+    max_attempts = int(os.environ["VANITY_MAX_ATTEMPTS"])
+
+    cpu = max(1, mp.cpu_count())
+    chunk = max(500_000, max_attempts // (cpu * 4) or 1)
+    tasks = []
+    lo = 0
+    hi = max_attempts
+    while lo < hi:
+        step = min(chunk, hi - lo)
+        tasks.append((lo, lo + step, prefix, tree, parents_block, author_ident, committer_ident, message, ts))
+        lo += step
+
+    try:
+        mp.set_start_method("fork", force=True)
+        with mp.Pool(cpu) as pool:
+            for nonce in pool.imap_unordered(search_range, tasks, chunksize=1):
+                if nonce is not None:
+                    build_bytes = build_bytes_factory(tree, parents_block, author_ident, committer_ident, message, ts)
+                    h = hashlib.sha1(build_bytes(nonce)).hexdigest()
+                    print(f"{nonce},{h}")
+                    pool.terminate()
+                    break
+    except Exception:
+        build_bytes = build_bytes_factory(tree, parents_block, author_ident, committer_ident, message, ts)
+        p = prefix
+        for nonce in range(0, max_attempts):
+            h = hashlib.sha1(build_bytes(nonce)).hexdigest()
+            if h.startswith(p):
+                print(f"{nonce},{h}")
+                break
+
+if __name__ == "__main__":
+    main()
+PY
+)
+
+if [ -z "$found_line" ]; then
+  echo "No matching commit found in $VANITY_MAX_ATTEMPTS attempts"
+  exit 1
+fi
+
+nonce=$(echo "$found_line" | cut -d, -f1)
+hash=$(echo "$found_line" | cut -d, -f2)
+
+echo "Found vanity hash: $hash (nonce: $nonce, timestamp: $VANITY_TIMESTAMP)"
+
+TREE=$(git write-tree)
+PARENT=$(git log -1 --format='%P')
+BASE_MESSAGE="$(git log -1 --format='%B' | sed 's/<!-- [0-9]* -->//' | sed 's/[[:space:]]*$//')"
+export GIT_AUTHOR_DATE="$VANITY_TIMESTAMP +0000"
+export GIT_COMMITTER_DATE="$VANITY_TIMESTAMP +0000"
+
+NEW_COMMIT=$(printf "%s\n\n<!-- %s -->\n" "$BASE_MESSAGE" "$nonce" | git commit-tree $TREE -p $PARENT -F -)
+
+git reset --hard $NEW_COMMIT
